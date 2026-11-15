@@ -419,7 +419,7 @@ def write_preview(path, res: Result, p: Params):
 
 
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="Round dice tray generator (STL).")
+    ap = argparse.ArgumentParser(description="Round dice tray generator (STL / 3MF).")
     d = Params()
     ap.add_argument("--variant", choices=["smooth", "random"], default=d.variant)
     ap.add_argument("--diameter", type=float, default=d.diameter)
