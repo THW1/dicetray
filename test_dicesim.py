@@ -83,3 +83,37 @@ def test_d10_kites_are_planar():
         pts = np.array([top, up[k], low[k], up[(k + 1) % 5]])
         n = np.cross(pts[1] - pts[0], pts[3] - pts[0])
         assert abs(np.dot(pts[2] - pts[0], n)) < 1e-9
+
+
+def test_face_counts_match_the_dice():
+    got = {k: len(ds.face_normals(ds.dice_vertices(k, ds.DICE_MM[k]))) for k in ds.DICE_MM}
+    assert got == {"d4": 4, "d6": 6, "d8": 8, "d10": 10, "d12": 12, "d20": 20}
+
+
+@pytest.mark.parametrize("kind", ["d4", "d6", "d20"])
+def test_up_face_points_upwards_for_random_orientations(kind):
+    from scipy.spatial.transform import Rotation
+    n = ds.face_normals(ds.dice_vertices(kind, ds.DICE_MM[kind]))
+    rng = np.random.default_rng(0)
+    for q in rng.normal(size=(20, 4)):
+        q = q / np.linalg.norm(q)
+        z = (Rotation.from_quat(q).as_matrix() @ n.T)[2]          # world z of every face normal
+        assert z[ds.up_face(n, q)] == pytest.approx(z.max())
+
+
+def test_die_on_the_flat_does_not_count_as_tumbled_or_slid(sim, tray):
+    floor = tray.V[0, 2]
+    sim.set_materials(0.4, 0.2)
+    (r,) = sim.run([spec("d6", (0, 0, floor + 8 + 6))], t_max=1.5)
+    assert r["status"] == "flat" and r["tumbles"] == 0 and r["touches"] == 0 and not r["slid"]
+
+
+def test_die_gliding_down_a_plain_cone_is_counted_as_slid(sim, tray):
+    pr = tray.prof
+    r0 = 0.5 * (pr["r_b"] + pr["r_s"])
+    zs = float(np.interp(r0, pr["R"][:pr["i_s"] + 1], pr["Z"][:pr["i_s"] + 1]))
+    a = math.radians(tray.info["min_descent_deg"])
+    pos = np.array([r0, 0.0, zs]) + np.array([-math.sin(a), 0.0, math.cos(a)]) * 8.05
+    sim.set_materials(0.1, 0.0)
+    (r,) = sim.run([spec("d6", tuple(pos), sim.pb.getQuaternionFromEuler([0, -a, 0]))], t_max=2.0)
+    assert r["status"] == "flat" and r["touches"] >= 3 and r["tumbles"] == 0 and r["slid"]

@@ -59,6 +59,18 @@ All lengths are in mm, angles in degrees. Defaults are in brackets.
 - `--no-autofit`: by default, a seed that breaks `--min-slope` is scaled down in 10 % steps until it passes. With this flag the run stops with an error instead.
 - `--stubs` (0): number of steeper rounded pegs in the middle of the slope. They can hold a die back, so the check only warns for them.
 
+**Deflectors (both variants)**
+
+Off by default. They break up a glide so that fast d4/d6 tumble. Results from the simulation are in DESIGN-v1.md, section 6; read them before printing, the gain is in collecting dice, not in a proven tumble.
+
+- `--deflectors none|diamonds|steps|both` (none): `diamonds` = short rounded bars (louvers) in staggered rings, tilted against the downhill direction, with the tilt alternating from ring to ring. `steps` = concentric drops on the cone. `both` = bars on top of steps, with the risers midway between the bar rings.
+- `--deflector-pitch` (10): radial distance between rings and risers. The number of rings follows from the width of the slope, so a 150 mm tray at 18° fits one or two rings and a 200 mm tray three.
+- `--bar-length` (14), `--bar-height` (3.0), `--bar-angle` (25): size of a bar (length includes the rounded ends; the base is 4 mm wide) and its tilt against the downhill direction.
+- `--bar-coverage` (0.5): largest share of a ring's circumference that its bars may block, so lanes stay open.
+- `--step-height` (2.0): drop of one riser. The treads between risers keep the `--min-slope` descent, and a step height that breaks it is scaled down like the bumps.
+- Bars are dams by design, so the no-trap rule of the bumps cannot hold for them. Instead the generator floods the finished height field from the inner edge and removes bars that close a basin deeper than 0.5 mm. This covers the frictionless case only; a die can still stick against a bar.
+- The bumps of a seed do not change when deflectors are switched on.
+
 **Output**
 
 - `--format stl|3mf|both` (stl): `3mf` writes one object with three colour parts (base, slope, wall).
@@ -86,6 +98,7 @@ The friction coefficient on printed plastic is not measured, so `--mu` is a swee
 The tray options `--diameter` (150 here), `--flat`, `--slope`, `--blend-radius`, `--floor`, `--wall-height`, `--seed`, `--amp`, `--sigma` and `--features` work as above.
 
 - `--variants` (smooth,random): trays to compare.
+- `--deflectors` (none): comma-separated list from `none,diamonds,steps,both`; every variant runs with each entry, e.g. `--deflectors none,diamonds,both`. The bar and step sizes use the generator options `--deflector-pitch`, `--step-height`, `--bar-length`, `--bar-height`, `--bar-angle` and `--bar-coverage`.
 - `--throws` (20): number of throws per tray and friction value. Each throw drops all selected dice. Ten throws of six dice give 60 dice per cell and a standard error of about 6 points.
 - `--throw-seed` (100): the same seed replays the same throws for every tray, so differences come from the tray.
 - `--dice` (d4,d6,d8,d10,d12,d20) and `--dice-scale` (1.0): which dice, and a size factor.
@@ -94,11 +107,11 @@ The tray options `--diameter` (150 here), `--flat`, `--slope`, `--blend-radius`,
 - `--aim` (0.8): each die is aimed at a random point within this fraction of the inner radius, so throws land inside the tray.
 - `--drop` (20,60): release height range of the lowest die above the rim, in mm. Each further die starts 24 mm higher.
 - `--t-max` (3.0): simulated seconds per throw. The result is the position at that time; a longer time lets creeping dice settle.
-- `--sim-res` (2.5): mesh sampling of the tray in the simulation. A coarser mesh runs faster.
-- `--by-type`: also print the share of dice on the flat per die type.
+- `--sim-res` (2.5) and `--sim-sectors` (240): mesh sampling of the tray in the simulation. A coarser mesh runs faster. With deflectors use about 1.0 and 480, otherwise the 4 mm bars are only a few samples wide.
+- `--by-type`: also print flat, tumble and slid shares per die type.
 - `--plot file.png`: final resting positions per variant and friction value.
 
-The table shows the share of dice per zone: flat centre, blend arc, cone (slope), and out (beyond the inner wall).
+The table shows the share of dice per zone: flat centre, blend arc, cone (slope), and out (beyond the inner wall). Two more columns look at the way down: `tumble%` is the share of dice whose up-face changed at least once while on the cone (sampled every 12.5 ms), `slid%` the share that ended on the flat after touching the cone without any change. A throw also changes the up-face on impact, so `tumble%` is high even on a plain cone and does not separate trays well; compare `flat%` and `slid%`.
 
 ## Test
 

@@ -21,6 +21,12 @@
 #                an acrylic density; inertia is that of a sphere of equal volume.
 #              - Result categories use the centre of mass: flat = r <= flat radius, blend = up to the
 #                end of the blend arc, slope = on the cone, out = beyond the inner wall (rim or outside).
+#              - Tumbling is measured by the up-face: every TRACK_EVERY steps (12.5 ms) the face whose
+#                normal points most upwards is recorded; a change between two samples in which the die
+#                touches the cone (r > flat edge, within a die size of the surface) counts as a tumble.
+#                "slid" = ended on the flat after touching the slope without a single change, i.e. the
+#                unwanted glide that deflectors are meant to prevent. Fast double flips between two
+#                samples are undercounted.
 # Constraints: pybullet, numpy, scipy (hull volume); matplotlib only for --plot. Single thread,
 #              deterministic for a given pybullet build.
 # Invariants:  Timestep 1/960 s: a falling die moves <3 mm per step, less than half the smallest
@@ -46,6 +52,7 @@ G = 9810.0 * SCALE                # gravity in sim units/s^2
 DT = 1.0 / 960.0
 SOLVER_ITERS = 60
 CHECK_EVERY = 48                  # steps between rest checks (0.05 s)
+TRACK_EVERY = 12                  # steps between orientation samples (12.5 ms); divides CHECK_EVERY
 PHI = (1 + math.sqrt(5)) / 2
 
 # typical edge/ring dimensions in mm (illustrative)
@@ -90,6 +97,24 @@ def dice_vertices(kind, size, scale=1.0):
     return np.array(v, dtype=float)
 
 
+def face_normals(v):
+    """Unit outward normals of the faces of the convex hull of v (coplanar triangles merged)."""
+    from scipy.spatial import ConvexHull
+    n = ConvexHull(v).equations[:, :3]
+    uniq = {}
+    for row in n:
+        uniq.setdefault(tuple(np.round(row, 3)), row)
+    return np.array(list(uniq.values()))
+
+
+def up_face(normals, quat):
+    """Index of the face pointing most upwards for orientation quat (x, y, z, w)."""
+    x, y, z, w = quat
+    # third row of the rotation matrix: z component of R @ n
+    rz = np.array([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)])
+    return int(np.argmax(normals @ rz))
+
+
 def hull_volume(v):
     from scipy.spatial import ConvexHull
     return ConvexHull(v).volume
@@ -110,10 +135,11 @@ class Sim:
         self.tray = pb.createMultiBody(0, shape, physicsClientId=c)
         plane = pb.createCollisionShape(pb.GEOM_PLANE, physicsClientId=c)
         self.ground = pb.createMultiBody(0, plane, physicsClientId=c)
-        self.shapes, self.mass, self.inertia = {}, {}, {}
+        self.shapes, self.mass, self.inertia, self.normals = {}, {}, {}, {}
         for k in kinds:
             v = dice_vertices(k, DICE_MM[k], dice_scale)
             self.shapes[k] = pb.createCollisionShape(pb.GEOM_MESH, vertices=(v * SCALE).tolist(), physicsClientId=c)
+            self.normals[k] = face_normals(v)
             vol = hull_volume(v * SCALE)                       # sim units^3
             self.mass[k] = vol * 1.2                           # acrylic ~1.2 g/cm3, arbitrary mass unit
             r_eq = (3 * vol / (4 * math.pi)) ** (1 / 3)
@@ -145,29 +171,51 @@ class Sim:
             pb.resetBaseVelocity(b, (np.asarray(s["lin_mps"]) * 1000.0 * SCALE).tolist(),
                                  list(s["ang_rps"]), physicsClientId=c)
             bodies.append(b)
-        calm, settled, r_in = 0, False, self.prof["R_in"]
+        prof = self.prof
+        calm, settled, r_in = 0, False, prof["R_in"]
+        nb = len(bodies)
+        face = [None] * nb                # last up-face while touching the cone
+        tumbles, touches = [0] * nb, [0] * nb
+        zs_R, zs_Z = prof["R"][:prof["i_w"] + 1], prof["Z"][:prof["i_w"] + 1]
         for step in range(1, int(t_max / DT) + 1):
             pb.stepSimulation(physicsClientId=c)
-            if step % CHECK_EVERY:
+            if step % TRACK_EVERY:
                 continue
+            check = step % CHECK_EVERY == 0
             moving = False
-            for b in bodies:
-                pos = np.array(pb.getBasePositionAndOrientation(b, physicsClientId=c)[0]) / SCALE
-                lin, ang = pb.getBaseVelocity(b, physicsClientId=c)
-                on_table = math.hypot(pos[0], pos[1]) > self.prof["R_out"] + 1.0
-                if not on_table and (np.linalg.norm(lin) / SCALE > 10.0 or np.linalg.norm(ang) > 1.0):
-                    moving = True
-            calm = 0 if moving else calm + 1
-            if calm >= 5:
-                settled = True
-                break
+            for i, b in enumerate(bodies):
+                p_, q_ = pb.getBasePositionAndOrientation(b, physicsClientId=c)
+                pos = np.array(p_) / SCALE
+                r = math.hypot(pos[0], pos[1])
+                kind = specs[i]["kind"]
+                above = pos[2] - float(np.interp(r, zs_R, zs_Z))
+                if prof["r_f"] < r <= r_in and above <= DICE_MM[kind]:
+                    f = up_face(self.normals[kind], q_)
+                    touches[i] += 1
+                    if face[i] is not None and f != face[i]:
+                        tumbles[i] += 1
+                    face[i] = f
+                else:
+                    face[i] = None
+                if check:
+                    lin, ang = pb.getBaseVelocity(b, physicsClientId=c)
+                    on_table = r > prof["R_out"] + 1.0
+                    if not on_table and (np.linalg.norm(lin) / SCALE > 10.0 or np.linalg.norm(ang) > 1.0):
+                        moving = True
+            if check:
+                calm = 0 if moving else calm + 1
+                if calm >= 5:
+                    settled = True
+                    break
         out = []
-        for s, b in zip(specs, bodies):
+        for i, (s, b) in enumerate(zip(specs, bodies)):
             pos = np.array(pb.getBasePositionAndOrientation(b, physicsClientId=c)[0]) / SCALE
             r = math.hypot(pos[0], pos[1])
-            status = ("out" if r > r_in else "flat" if r <= self.prof["r_f"]
-                      else "blend" if r <= self.prof["r_b"] else "slope")
-            out.append(dict(kind=s["kind"], x=pos[0], y=pos[1], z=pos[2], r=r, status=status, settled=settled))
+            status = ("out" if r > r_in else "flat" if r <= prof["r_f"]
+                      else "blend" if r <= prof["r_b"] else "slope")
+            out.append(dict(kind=s["kind"], x=pos[0], y=pos[1], z=pos[2], r=r, status=status, settled=settled,
+                            tumbles=tumbles[i], touches=touches[i],
+                            slid=bool(status == "flat" and touches[i] >= 3 and tumbles[i] == 0)))
             pb.removeBody(b, physicsClientId=c)
         return out
 
@@ -210,6 +258,13 @@ def summarize(rows):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Dice-throw simulation for dicetray.py trays.")
     ap.add_argument("--variants", default="smooth,random")
+    ap.add_argument("--deflectors", default="none", help="comma separated list of none,diamonds,steps,both; every variant is run with each")
+    ap.add_argument("--deflector-pitch", type=float, default=dt.Params.deflector_pitch)
+    ap.add_argument("--step-height", type=float, default=dt.Params.step_height)
+    ap.add_argument("--bar-length", type=float, default=dt.Params.bar_length)
+    ap.add_argument("--bar-height", type=float, default=dt.Params.bar_height)
+    ap.add_argument("--bar-angle", type=float, default=dt.Params.bar_angle)
+    ap.add_argument("--bar-coverage", type=float, default=dt.Params.bar_coverage)
     ap.add_argument("--diameter", type=float, default=150.0)
     ap.add_argument("--flat", type=float, default=None)
     ap.add_argument("--slope", type=float, default=18.0)
@@ -229,7 +284,8 @@ def parse_args(argv=None):
     ap.add_argument("--aim", type=float, default=0.8, help="dice are aimed at random points within this fraction of the inner radius")
     ap.add_argument("--drop", default="20,60", help="release height range of the lowest die above the rim, mm")
     ap.add_argument("--t-max", type=float, default=3.0)
-    ap.add_argument("--sim-res", type=float, default=2.5)
+    ap.add_argument("--sim-res", type=float, default=2.5, help="profile step of the simulated tray, mm (use ~1 with deflectors)")
+    ap.add_argument("--sim-sectors", type=int, default=240, help="angular sectors of the simulated tray (use ~480 with deflectors)")
     ap.add_argument("--by-type", action="store_true")
     ap.add_argument("--plot", help="PNG with final resting positions")
     return ap.parse_args(argv)
@@ -242,41 +298,50 @@ def main(argv=None):
     drop = tuple(float(x) for x in a.drop.split(","))
     results = {}
     trays = {}
-    for variant in [v.strip() for v in a.variants.split(",")]:
+    configs = [(v.strip(), d.strip()) for v in a.variants.split(",") for d in a.deflectors.split(",")]
+    for variant, defl in configs:
+        label = variant if defl == "none" else f"{variant}+{defl}"
         p = dt.Params(variant=variant, diameter=a.diameter, flat=a.flat, slope=a.slope, floor=a.floor,
-                      wall_height=a.wall_height, blend_radius=a.blend_radius, seed=a.seed, amp=a.amp, sigma=a.sigma, features=a.features,
-                      res=a.sim_res, sectors=240)
+                      wall_height=a.wall_height, blend_radius=a.blend_radius, seed=a.seed, amp=a.amp, sigma=a.sigma,
+                      features=a.features, res=a.sim_res, sectors=a.sim_sectors, deflectors=defl,
+                      deflector_pitch=a.deflector_pitch, step_height=a.step_height, bar_length=a.bar_length,
+                      bar_height=a.bar_height, bar_angle=a.bar_angle, bar_coverage=a.bar_coverage)
         try:
             tray = dt.generate(p)
         except (ValueError, dt.DescentError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
         sim = Sim(tray, a.dice_scale, kinds)
-        trays[variant] = tray
+        trays[label] = tray
         for mu in mus:
             sim.set_materials(mu, a.restitution)
             rows = []
             for t in range(a.throws):
                 rows += sim.run(random_throw(a.throw_seed + t, kinds, tray.prof, a.aim, drop), a.t_max)
-            results[(variant, mu)] = rows
+            results[(label, mu)] = rows
         sim.close()
 
     print(f"tray d={a.diameter:g} mm, slope {a.slope:g} deg, {a.throws} throws x {len(kinds)} dice, "
           f"restitution {a.restitution:g}, aim {a.aim:g} x inner radius, drop {drop[0]:g}-{drop[1]:g} mm")
-    print(f"{'variant':8s} {'mu':>5s} {'n':>5s} {'flat%':>6s} {'blend%':>7s} {'slope%':>7s} {'out%':>6s} {'unsettled%':>11s}")
-    for (variant, mu), rows in results.items():
+    print(f"{'tray':16s} {'mu':>5s} {'n':>5s} {'flat%':>6s} {'blend%':>7s} {'slope%':>7s} {'out%':>6s} "
+          f"{'tumble%':>8s} {'slid%':>6s} {'unsettled%':>11s}")
+    for (label, mu), rows in results.items():
         n, c, uns = summarize(rows)
-        print(f"{variant:8s} {mu:5.2f} {n:5d} {100 * c['flat'] / n:6.1f} {100 * c['blend'] / n:7.1f} {100 * c['slope'] / n:7.1f} "
-              f"{100 * c['out'] / n:6.1f} {100 * uns / n:11.1f}")
+        tum = sum(r["tumbles"] > 0 for r in rows)
+        slid = sum(r["slid"] for r in rows)
+        print(f"{label:16s} {mu:5.2f} {n:5d} {100 * c['flat'] / n:6.1f} {100 * c['blend'] / n:7.1f} {100 * c['slope'] / n:7.1f} "
+              f"{100 * c['out'] / n:6.1f} {100 * tum / n:8.1f} {100 * slid / n:6.1f} {100 * uns / n:11.1f}")
     if a.by_type:
-        print("\nflat% by die type")
-        print(f"{'variant':8s} {'mu':>5s} " + " ".join(f"{k:>5s}" for k in kinds))
-        for (variant, mu), rows in results.items():
-            cells = []
-            for k in kinds:
-                sub = [r for r in rows if r["kind"] == k]
-                cells.append(f"{100 * sum(r['status'] == 'flat' for r in sub) / len(sub):5.0f}")
-            print(f"{variant:8s} {mu:5.2f} " + " ".join(cells))
+        for title, f in (("flat%", lambda r: r["status"] == "flat"), ("tumble% (>= 1 up-face change on the cone)", lambda r: r["tumbles"] > 0),
+                         ("slid% (flat after touching the cone without tumbling)", lambda r: r["slid"])):
+            print(f"\n{title} by die type")
+            print(f"{'tray':16s} {'mu':>5s} " + " ".join(f"{k:>5s}" for k in kinds))
+            for (label, mu), rows in results.items():
+                cells = []
+                for k in kinds:
+                    sub = [r for r in rows if r["kind"] == k]
+                    cells.append(f"{100 * sum(f(r) for r in sub) / len(sub):5.0f}")
+                print(f"{label:16s} {mu:5.2f} " + " ".join(cells))
     if a.plot:
         write_plot(a.plot, results, trays, mus)
         print(f"wrote {a.plot}")

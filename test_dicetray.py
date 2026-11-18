@@ -173,3 +173,84 @@ def test_3mf_loads_in_an_independent_reader(tmp_path):
     meshes = list(sc.geometry.values())
     assert len(meshes) == 3 and all(m.is_watertight for m in meshes)
     assert sum(m.volume for m in meshes) == pytest.approx(dt.mesh_stats(res.V, res.F)[0], rel=1e-5)
+
+
+# ---- deflectors -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", ["steps", "diamonds", "both"])
+def test_deflector_meshes_are_watertight_and_stay_inside_the_cone_band(mode):
+    base = dt.generate(dt.Params(diameter=200, sectors=360))
+    res = dt.generate(dt.Params(diameter=200, sectors=360, deflectors=mode))
+    vol, wt = dt.mesh_stats(res.V, res.F)
+    assert wt and vol > 0
+    r = np.hypot(res.V[:, 0], res.V[:, 1])
+    prof = res.prof
+    far = (r <= prof["r_b"] + 1e-6) | (r >= prof["r_s"] - 1e-6)
+    # identical to the plain tray outside the cone: no height step at blend or fillet
+    ref = dt.generate(dt.Params(diameter=200, sectors=360))
+    assert np.allclose(res.V[far], ref.V[far])
+    assert res.V[:, 2].max() == pytest.approx(base.V[:, 2].max())      # wall height unchanged
+
+
+def test_steps_keep_the_descent_rule_and_autofit_shrinks_tall_steps():
+    ok = dt.generate(dt.Params(diameter=200, deflectors="steps"))
+    assert ok.info["min_descent_deg"] >= 8.0 and ok.info["n_risers"] >= 2 and ok.info["amp_scale"] == 1.0
+    tall = dt.generate(dt.Params(diameter=200, deflectors="steps", step_height=5.0))
+    assert tall.info["amp_scale"] < 1.0 and tall.info["min_descent_deg"] >= 8.0
+    with pytest.raises(dt.DescentError):
+        dt.generate(dt.Params(diameter=200, deflectors="steps", step_height=5.0, autofit=False))
+
+
+def test_bars_are_seeded_and_do_not_move_the_random_bumps():
+    a = dt.generate(dt.Params(variant="random", seed=5, diameter=200, sectors=180, deflectors="diamonds"))
+    b = dt.generate(dt.Params(variant="random", seed=5, diameter=200, sectors=180, deflectors="diamonds"))
+    c = dt.generate(dt.Params(variant="random", seed=6, diameter=200, sectors=180, deflectors="diamonds"))
+    plain = dt.generate(dt.Params(variant="random", seed=5, diameter=200, sectors=180))
+    assert np.array_equal(a.V, b.V) and not np.array_equal(a.V, c.V)
+    assert np.array_equal(a.rand, plain.rand)
+
+
+def test_bar_rings_respect_coverage_and_the_bar_height():
+    p = dt.Params(diameter=200, sectors=720, deflectors="diamonds", bar_coverage=0.4)
+    res = dt.generate(p)
+    plain = dt.generate(dt.Params(diameter=200, sectors=720))
+    lift = res.V[:, 2] - plain.V[:, 2]
+    assert lift.max() == pytest.approx(p.bar_height, abs=0.15) and lift.min() >= -1e-9
+    for r in res.defl["rings"]:
+        bars = [b for b in res.defl["bars"] if abs(math.hypot(b[0], b[1]) - r) < 1e-6]
+        half = res.defl["bars"][0][3]
+        ext = 2 * half * math.sin(math.radians(p.bar_angle)) + 2 * dt.BAR_W
+        assert len(bars) * ext <= 0.4 * 2 * math.pi * r + 1e-6
+
+
+def test_pocket_depth_finds_a_basin_and_ignores_a_plain_slope():
+    r = np.linspace(0, 10, 11)[:, None]
+    Z = np.repeat(r, 36, axis=1)                 # rises outwards, row 0 is the outlet
+    assert dt.pocket_depth(Z).max() == pytest.approx(0.0)
+    Z2 = Z.copy()
+    Z2[4, :] += 3.0                              # a complete ring dam: water ponds uphill of it up to the crest
+    assert dt.pocket_depth(Z2).max() == pytest.approx(2.0)
+    Z2[4, 7] -= 3.0                              # one gap in the ring lets the water out again
+    assert dt.pocket_depth(Z2).max() == pytest.approx(0.0)
+
+
+def test_closed_ring_of_tangential_bars_is_repaired():
+    p = dt.Params(diameter=200, sectors=360, deflectors="diamonds", bar_coverage=1.0,
+                  bar_angle=90.0, bar_length=40.0)
+    res = dt.generate(p)
+    assert res.info["bars_removed"] >= 1 and res.info["max_pocket_mm"] <= dt.POCKET_TOL
+    assert any("removed" in w for w in res.info["warnings"])
+
+
+def test_unknown_deflector_mode_is_rejected():
+    with pytest.raises(ValueError):
+        dt.generate(dt.Params(deflectors="spikes"))
+
+
+def test_zones_with_deflectors_still_sum_to_the_body():
+    p = dt.Params(diameter=200, sectors=240, deflectors="both")
+    res = dt.generate(p)
+    parts = dt.build_zones(res, p)
+    total = sum(dt.mesh_stats(*parts[n])[0] for n in parts)
+    assert all(dt.mesh_stats(*parts[n])[1] for n in parts)
+    assert total == pytest.approx(dt.mesh_stats(res.V, res.F)[0], rel=1e-5)

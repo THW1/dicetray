@@ -1,8 +1,10 @@
-# Round dice tray with centre funnel — design document v1.2
+# Round dice tray with centre funnel — design document v1.3
 
 Hobby project: a round, 3D-printed dice tray whose sloped ring drives thrown dice into a flat centre. Two variants: **smooth** (plain cone) and **random** (cone plus soft bumps and dimples that add twists but never trap a die). Output as STL, or as a 3MF with three colour parts.
 
 Date: 2026-11-15 · Printer: Elegoo Centauri Carbon 2 (build volume 256 × 256 × 256 mm, per project FAQ) · Slicer: ElegooSlicer · Code: `dicetray.py` (generator), `dicesim.py` (dice simulation), repo https://github.com/THW1/dicetray
+
+Changes since v1.2: optional deflectors (tilted bars, concentric steps, or both) and a tumble metric in the simulation (section 6).
 
 Changes since v1.1: centre floor reduced to 1.0 mm (5 layers at 0.2 mm); 3MF export with three colour zones; rigid-body dice simulation, which shows that the 18° default is too gentle for friction values of 0.4 and above (section 5).
 
@@ -100,14 +102,46 @@ Reading the table:
 
 Limits: sizes, density, restitution (0.3) and the throw model are illustrative; μ on printed plastic is unknown, which is why μ is a sweep. Use the numbers to compare trays and see trends, not as a prediction for a specific dice set. A confirmed test print with your dice beats the simulation.
 
-## 6. Printing
+## 6. Deflectors (optional)
+
+Question: can obstacles like those on a roulette wheel make d4/d6 tumble instead of gliding down the cone? A plain bar across the flow is a dam and holds dice, so two shapes were built (`--deflectors`):
+
+- **steps**: concentric risers of 2 mm. Moving inwards, a die drops off each riser. The treads between them rise outwards at the cone angle minus the share used by the risers, so the radial descent stays ≥ `--min-slope` and the no-trap rule of section 3 holds exactly. Steps and bumps share the autofit scale.
+- **diamonds**: short rounded bars (14 mm long, 4 mm wide at the base, 3 mm high) in staggered rings, 25° off the downhill direction, one tilt per ring, alternating between rings. At most half of a ring is covered, so there is always a lane. Bars are dams on purpose, so the radial rule cannot hold for them. The generator floods the finished height field from the inner edge (priority flood) and removes bars that close a basin deeper than 0.5 mm. This guards the frictionless limit only. Whether a die sticks against a bar depends on μ and the angle; the geometric condition I derived for sliding along a bar, tan(slope)·(cos φ − μ_bar·sin φ) > μ, is my own and was not checked against a source.
+- **both**: bars on top of steps, risers midway between the bar rings.
+
+Chevron (V) bars were rejected because the funnel between two bars is narrower than a d6, and a free random bar layout because neighbouring bars close pockets. The bumps of a seed are the same with and without deflectors.
+
+The simulation got two metrics: **tumble** = the up-face changed at least once between samples (every 12.5 ms) while the die touched the cone, and **slid** = the die ended on the flat after touching the cone without any change. Setup: smooth tray, d4 and d6 only, 40 throws each = 80 dice per cell (standard error about ±5 points per cell, ±8 per die type), same throws for every tray, 6 s simulated, finer tray mesh (1 mm, 480 sectors). Cells show flat % (d4 / d6) and, after the slash, the share left on the cone.
+
+| Tray | μ | none | steps | diamonds | both |
+|---|---|---|---|---|---|
+| 200 mm, 30°, blend 10 | 0.3 | 61 (48/75) / 8 | 69 (50/88) / 8 | 83 (65/100) / 14 | 76 (52/100) / 18 |
+| 200 mm, 30°, blend 10 | 0.5 | 46 (22/70) / 11 | 51 (22/80) / 24 | 64 (38/90) / 26 | 64 (32/95) / 20 |
+| 200 mm, 18°, blend 30 | 0.2 | 43 (42/42) / 1 | 46 (45/48) / 3 | 59 (45/72) / 30 | 66 (52/80) / 18 |
+| 200 mm, 18°, blend 30 | 0.3 | 35 (32/38) / 9 | 24 (18/30) / 15 | 35 (22/48) / 36 | 40 (20/60) / 28 |
+| 150 mm, 30°, blend 10 | 0.3 | 78 (68/88) / 4 | – | 85 (70/100) / 11 | 81 (62/100) / 10 |
+| 150 mm, 30°, blend 10 | 0.5 | 56 (40/72) / 5 | – | 64 (40/88) / 14 | 71 (55/88) / 14 |
+
+Reading the table:
+
+- Bars raised the share of d6 on the flat in all six comparisons (+10 to +30 points, up to 100 % at μ = 0.3 and 30°). For d4 the gain appeared only at 200 mm / 30° (+16 to +17 points); elsewhere it was +3, −10, +2 and 0, which is within noise.
+- The price is more dice staying on the cone: 1–11 % on the plain tray against 10–36 % with bars. At 18° the bars take dice mostly from the blend arc (56 % on the blend with the plain tray, 11–33 % with bars), so the net gain on the flat is smaller than the d6 numbers suggest.
+- **The metrics do not show forced tumbling.** The up-face changes for 56–79 % of the dice on every tray, including the plain cone, because the throw itself and the first bounce already turn the die. The share of dice that glided down without any change (`slid`) was 2–18 % everywhere, and the differences between trays are within noise. So the data support better collecting of d6, not the claim that the bars make the dice tumble.
+- Steps alone did nothing measurable (−11 to +8 points, within noise); at 18° and μ = 0.3 the result was worse. Both combined was not better than diamonds alone (differences of −6 to +7 points). I see no reason to prefer `both` on this evidence; it only adds the risers.
+- In 17–57 % of the cells' throws some die was still moving at 6 s, so the classification is a snapshot, as in section 5.
+- Not examined: other bar angles, heights and lengths, or whether a die can rest across two bars. Defaults are first guesses.
+
+Suggestion: first test print without deflectors, then a 200 mm tray with `--deflectors diamonds` and see whether d6 and d4 collect better with your dice and your surface.
+
+## 7. Printing
 
 - Print upright, flat bottom down, no supports.
 - PETG or PLA, 0.4 mm nozzle. Walls 3–4, gyroid infill 8–10 %. The 1 mm centre is five solid layers: set at least 5 bottom and 5 top layers so it does not turn into infill.
 - Slope surface: variable layer height 0.08–0.12 mm reduces visible steps on the shallow blend; the flat centre can use 0.2 mm.
 - Optional felt disc in the centre: `--felt 50 --floor 2` cuts a 1 mm recess, leaving a 1 mm floor.
 
-## 7. Usage
+## 8. Usage
 
 ```
 python3 dicetray.py --variant smooth --diameter 150
@@ -115,11 +149,14 @@ python3 dicetray.py --variant random --diameter 200 --seed 7 --preview preview.p
 python3 dicetray.py --variant random --diameter 150 --format 3mf --filaments 1,2,3
 python3 dicetray.py --diameter 150 --slope 30 --blend-radius 10 --format both --zone-stls
 python3 dicesim.py --diameter 150 --throws 12 --mu 0.2,0.4,0.6 --by-type --plot sim.png
+python3 dicetray.py --diameter 200 --deflectors diamonds --preview defl.png
+python3 dicesim.py --variants smooth --deflectors none,diamonds,both --diameter 200 --slope 30 --blend-radius 10 \
+  --dice d4,d6 --throws 40 --mu 0.3,0.5 --t-max 6 --sim-res 1.0 --sim-sectors 480 --by-type
 ```
 
-Every generator run prints diameter, height, volume, watertight status, measured minimum descent angle and the autofit scale. Run `dicesim.py` without `-I` so the script directory is importable. A 12-throw sweep over two variants and three μ values takes about 5–8 minutes on two cores.
+Every generator run prints diameter, height, volume, watertight status, measured minimum descent angle and the autofit scale. Run `dicesim.py` without `-I` so the script directory is importable. A 12-throw sweep over two variants and three μ values takes about 5–8 minutes on two cores; the deflector sweep above (3–4 trays, two μ, 80 dice per cell) about 15–25 minutes.
 
-## 8. Test plan
+## 9. Test plan
 
 1. Print the 150 mm smooth tray with `--slope 30 --blend-radius 10`, and one with the 18° default if you want the comparison. Throw your usual dice set 50 times from about 30 cm height and count the dice that end outside the flat centre.
 2. If many dice stop on the slope, raise the slope or polish the slope surface (it lowers friction). If they leave the tray, raise `--wall-height`.
@@ -127,16 +164,16 @@ Every generator run prints diameter, height, volume, watertight status, measured
 4. Open the 3MF in ElegooSlicer, check that three parts with filaments 1–3 appear; if not, use `--zone-stls`.
 5. Then 200 mm, and 220 mm if needed.
 
-## 9. Assumptions and limits
+## 10. Assumptions and limits
 
 - μ range, dice dimensions and the throw model are assumptions until a test print says otherwise.
 - The no-trap rule covers the radial direction on the cone and a die treated as a point.
 - The 3MF is untested in ElegooSlicer (section 4).
 - A sector or wedge export for quick tests is not implemented; use the small diameter.
 
-## 10. Files
+## 11. Files
 
 - `dicetray.py` — generator (STL, 3MF, preview); the file header holds the design decisions and invariants.
 - `dicesim.py` — pybullet dice simulation.
-- `test_dicetray.py` — 44 tests: watertight mesh, volume against the analytic value, seed determinism, no-trap check, autofit repair, felt recess, STL size, 5-layer floor, zones watertight and adding up to the body, 3MF structure and independent reload.
-- `test_dicesim.py` — 12 tests: rest height, friction threshold on the cone, determinism, dice geometry.
+- `test_dicetray.py` — 54 tests: watertight mesh, volume against the analytic value, seed determinism, no-trap check, autofit repair, felt recess, STL size, 5-layer floor, zones watertight and adding up to the body, 3MF structure and independent reload, deflectors (watertight, unchanged outside the cone, step descent and autofit, bars seeded and coverage-limited, flood check, repair of a closed ring).
+- `test_dicesim.py` — 18 tests: rest height, friction threshold on the cone, determinism, dice geometry, face counts and up-face detection, tumble/slid flags.

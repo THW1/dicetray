@@ -25,6 +25,19 @@
 #                --zone-stls writes the same three parts as STLs for a manual multi-part import.
 #              - floor = 1.0 mm (5 layers at 0.2 mm): the centre is nearly flush with the bed
 #                layer, which saves material and time. A felt recess needs a thicker --floor.
+#              - Deflectors (--deflectors, off by default) make fast d4/d6 tumble instead of glide.
+#                "steps" = concentric risers (a drop for an inward-moving die); the treads keep
+#                a descent of >= --min-slope, so the no-trap rule stays exact (checked by
+#                check_descent, steps share the autofit scale with the random bumps).
+#                "diamonds" = short rounded bars (louvers) in staggered rings, one tilt direction
+#                per ring, alternating between rings. Bars are dams on purpose, so they cannot
+#                satisfy dz/dr > 0; instead the finished height field is flooded from the inner
+#                edge (pocket_depth) and bars that close a basin are removed. This guards the
+#                frictionless limit only; whether dice stick against a bar is for dicesim.py.
+#                Rejected: chevron/V bars (funnel narrower than a d6), bars on a free random
+#                layout (closed pockets between neighbours).
+#              - Deflector layout uses its own rng stream (seed + 7919), so the random bumps of a
+#                given seed are identical with and without deflectors.
 # Constraints: Python >= 3.10, numpy. matplotlib only for --preview.
 #              Bed of the Elegoo Centauri Carbon 2 is 256 x 256 mm -> warn above 250 mm.
 # Invariants:  Profile order is top pole -> outwards -> rim -> outer wall -> bottom pole;
@@ -36,7 +49,9 @@
 #              rationale and print settings; dicesim.py imports generate() and the profile radii;
 #              test_dicetray.py checks mesh, zone and descent rules.
 # Tests:       python3 -I -m pytest test_dicetray.py
-# Limitations: Dice motion is not simulated; mu and the 18 deg default need a test print.
+# Limitations: Dice motion only in dicesim.py (assumed mu); mu and the 18 deg default need a test print.
+#              Deflector sizes (3 mm bars, 2 mm risers) are first guesses to be tuned by simulation
+#              and by test prints; at the default 150 mm / 18 deg only one or two rings fit.
 #              --stubs (steep pegs) can break the no-trap guarantee, so the descent check
 #              only warns for them. No sector/wedge export. 3MF zones: --zone-wall-z must lie on
 #              the vertical wall and --zone-base-r between flat edge and blend end (undisplaced rows).
@@ -75,6 +90,19 @@ class Params:
     sectors: int = 720
     zone_base_r: float | None = None  # 3MF: outer radius of the base zone; None -> end of blend
     zone_wall_z: float | None = None  # 3MF: height where the wall zone starts; None -> top of fillet
+    deflectors: str = "none"         # "none" | "diamonds" | "steps" | "both"
+    deflector_pitch: float = 10.0    # radial distance between bar rings / risers, mm
+    step_height: float = 2.0         # drop of one riser, mm
+    bar_length: float = 14.0         # bar length incl. rounded ends, mm
+    bar_height: float = 3.0          # bar crest above the cone, mm
+    bar_angle: float = 25.0          # bar tilt against the downhill direction, deg
+    bar_coverage: float = 0.5        # max share of a ring's circumference blocked by its bars
+
+
+BAR_W = 2.0        # half width of a bar at its base, mm
+RISER_W = 2.0      # horizontal width of a riser, mm
+POCKET_TOL = 0.5   # deepest basin tolerated after flooding the height field, mm
+DEFLECTORS = ("none", "diamonds", "steps", "both")
 
 
 class DescentError(RuntimeError):
@@ -189,6 +217,93 @@ def displacement(prof, rand, stubs, scale, X, Y):
     return np.where((r > r_b) & (r < r_s), d, 0.0)
 
 
+def make_deflectors(p: Params, prof):
+    """Seeded layout of risers and bars on the cone. Returns dict(rings, risers, bars) with
+    bars = list of (x, y, axis angle, half segment length). Rings sit evenly between the first
+    and last radius where a whole bar still fits; risers sit midway between rings."""
+    rng = np.random.default_rng(p.seed + 7919)
+    a = math.radians(p.bar_angle)
+    half = max(0.0, p.bar_length / 2.0 - BAR_W)
+    ext_r = half * math.cos(a) + BAR_W
+    lo, hi = prof["r_b"] + ext_r + 2.0, prof["r_s"] - ext_r - 2.0
+    rings = np.zeros(0)
+    if hi >= lo:
+        n = int((hi - lo) // p.deflector_pitch) + 1
+        rings = np.linspace(lo, hi, n) if n > 1 else np.array([0.5 * (lo + hi)])
+    pitch = float(rings[1] - rings[0]) if len(rings) > 1 else p.deflector_pitch
+    risers = rings + 0.5 * pitch
+    risers = risers[(risers >= prof["r_b"] + 3.0) & (risers <= prof["r_s"] - 3.0)]
+    bars = []
+    ext_t = 2.0 * half * math.sin(a) + 2.0 * BAR_W
+    for i, r in enumerate(rings):
+        n = max(1, int(p.bar_coverage * 2.0 * math.pi * r / ext_t))
+        th0 = rng.uniform(0.0, 2.0 * math.pi)
+        sgn = 1.0 if i % 2 == 0 else -1.0
+        for j in range(n):
+            th = th0 + 2.0 * math.pi * (j + rng.uniform(-0.1, 0.1)) / n
+            bars.append((r * math.cos(th), r * math.sin(th), th + sgn * a, half))
+    return dict(rings=rings, risers=risers, bars=bars)
+
+
+def step_field(prof, risers, s, X, Y):
+    """Sawtooth offset: each riser raises the surface by s going outwards, a linear trend
+    takes it back, so the offset is exactly 0 at r_b and r_s (no step at the cone ends)."""
+    r = np.hypot(X, Y)
+    r_b, r_s = prof["r_b"], prof["r_s"]
+    if not len(risers):
+        return np.zeros_like(X)
+    d = sum(smoothstep((r - (rk - RISER_W / 2.0)) / RISER_W) for rk in risers)
+    d = d - len(risers) * (r - r_b) / (r_s - r_b)
+    return np.where((r > r_b) & (r < r_s), s * d, 0.0)
+
+
+def bar_field(bars, H, X, Y):
+    """Height of rounded bars (capsule footprint, smoothstep flanks); overlaps take the maximum."""
+    d = np.zeros_like(X)
+    for x0, y0, ang, half in bars:
+        ux, uy = math.cos(ang), math.sin(ang)
+        dx, dy = X - x0, Y - y0
+        t = np.clip(dx * ux + dy * uy, -half, half)
+        dist = np.hypot(dx - t * ux, dy - t * uy)
+        d = np.maximum(d, H * (1.0 - smoothstep(dist / BAR_W)))
+    return d
+
+
+def pocket_depth(Zc):
+    """Depth of the basins in a height field Zc (rows = radii, row 0 = inner outlet, columns
+    periodic): how far water would pond if it could only leave through row 0 (priority flood)."""
+    import heapq
+    nr, M = Zc.shape
+    filled = np.full((nr, M), np.inf)
+    filled[0] = Zc[0]
+    heap = [(float(Zc[0, j]), 0, j) for j in range(M)]
+    heapq.heapify(heap)
+    while heap:
+        z, k, j = heapq.heappop(heap)
+        if z > filled[k, j]:
+            continue
+        for k2, j2 in ((k - 1, j), (k + 1, j), (k, (j - 1) % M), (k, (j + 1) % M)):
+            if 0 <= k2 < nr:
+                nz = max(float(Zc[k2, j2]), z)
+                if nz < filled[k2, j2]:
+                    filled[k2, j2] = nz
+                    heapq.heappush(heap, (nz, k2, j2))
+    return filled - Zc
+
+
+def deflector_field(res, p: Params, X, Y):
+    """Steps + bars offset at arbitrary points (preview); (0 if no deflectors)."""
+    d = getattr(res, "defl", None)
+    if not d:
+        return np.zeros_like(X)
+    out = np.zeros_like(X)
+    if p.deflectors in ("steps", "both"):
+        out = out + step_field(res.prof, d["risers"], p.step_height * res.scale, X, Y)
+    if p.deflectors in ("diamonds", "both") and d["bars"]:
+        out = out + bar_field(d["bars"], p.bar_height, X, Y)
+    return out
+
+
 def check_descent(prof, Zc):
     """Smallest radial descent angle (deg) over all cone columns; Zc rows = cone profile points."""
     Rc = prof["R"][prof["i_b"]:prof["i_s"] + 1]
@@ -240,6 +355,8 @@ def mesh_stats(V, F):
 
 
 def generate(p: Params) -> Result:
+    if p.deflectors not in DEFLECTORS:
+        raise ValueError(f"deflectors must be one of {', '.join(DEFLECTORS)}")
     prof = build_profile(p)
     R, Z0 = prof["R"], prof["Z"]
     n, M = len(R), p.sectors
@@ -252,20 +369,32 @@ def generate(p: Params) -> Result:
     rows = np.arange(i_b, i_s + 1)
     X, Y = R[rows, None] * np.cos(th)[None, :], R[rows, None] * np.sin(th)[None, :]
 
+    defl = make_deflectors(p, prof) if p.deflectors != "none" else None
+    use_steps = defl is not None and p.deflectors in ("steps", "both") and len(defl["risers"]) > 0
+    use_bars = defl is not None and p.deflectors in ("diamonds", "both") and len(defl["bars"]) > 0
+    if defl is not None and not (use_steps or use_bars):
+        warnings.append("no room for deflectors on this slope: reduce --bar-length or raise --diameter")
     if p.variant == "random":
         rand, stubs = make_features(p, prof, np.random.default_rng(p.seed))
         if p.features is not None and len(rand) < p.features:
             warnings.append(f"only {len(rand)} of {p.features} features fit")
-        while True:
-            D = displacement(prof, rand, stubs, scale, X, Y)
-            D[0], D[-1] = 0.0, 0.0
-            ms = check_descent(prof, Z0[rows, None] + D)
-            if ms >= p.min_slope or not p.autofit or scale < 0.05:
-                break
-            scale *= 0.9
-        Z[rows] += D
-    else:
-        ms = check_descent(prof, Z0[rows, None] + np.zeros_like(X))
+
+    def shape(sc):
+        D = np.zeros_like(X)
+        if p.variant == "random":
+            D = D + displacement(prof, rand, stubs, sc, X, Y)
+        if use_steps:
+            D = D + step_field(prof, defl["risers"], p.step_height * sc, X, Y)
+        D[0], D[-1] = 0.0, 0.0
+        return D
+
+    while True:                       # steps and bumps share one amplitude scale; bars are not part of the rule
+        D = shape(scale)
+        ms = check_descent(prof, Z0[rows, None] + D)
+        if ms >= p.min_slope or not p.autofit or scale < 0.05 or not (p.variant == "random" or use_steps):
+            break
+        scale *= 0.9
+    Z[rows] += D
 
     if ms < p.min_slope:
         msg = f"descent check failed: steepest-descent angle {ms:.1f} deg < {p.min_slope:.1f} deg"
@@ -274,16 +403,37 @@ def generate(p: Params) -> Result:
         else:
             raise DescentError(msg)
 
+    removed, pocket = 0, 0.0
+    if use_bars:
+        bars = list(defl["bars"])
+        while True:
+            B = bar_field(bars, p.bar_height, X, Y)
+            depth = pocket_depth(Z[rows] + B)
+            pocket = float(depth.max())
+            if pocket <= POCKET_TOL or not bars:
+                break
+            k, j = np.unravel_index(int(depth.argmax()), depth.shape)
+            near = min(range(len(bars)), key=lambda q: math.hypot(bars[q][0] - X[k, j], bars[q][1] - Y[k, j]))
+            bars.pop(near)
+            removed += 1
+        defl["bars"] = bars
+        Z[rows] += bar_field(bars, p.bar_height, X, Y) if bars else 0.0
+        if removed:
+            warnings.append(f"{removed} bar(s) removed: they closed a basin deeper than {POCKET_TOL:g} mm")
+
     V, F = build_mesh(R, Z, M)
     vol, wt = mesh_stats(V, F)
     info = dict(diameter=2 * prof["R_out"], flat=prof["flat"], height=float(V[:, 2].max()),
                 slope_run=prof["r_s"] - prof["r_b"], wall_base_z=prof["z_wall"], volume_cm3=vol / 1000.0,
                 triangles=len(F), watertight=wt, min_descent_deg=ms, amp_scale=scale,
-                n_features=len(rand), n_stubs=len(stubs), warnings=warnings)
+                n_features=len(rand), n_stubs=len(stubs),
+                n_bars=len(defl["bars"]) if use_bars else 0, n_risers=len(defl["risers"]) if use_steps else 0,
+                bars_removed=removed, max_pocket_mm=pocket, warnings=warnings)
     if info["diameter"] > 250:
         warnings.append("diameter > 250 mm: tight on a 256 mm bed")
     res = Result(V, F, info)
     res.prof, res.rand, res.stubs, res.scale, res.Z = prof, rand, stubs, scale, Z
+    res.defl = defl if (use_steps or use_bars) else None
     return res
 
 
@@ -400,16 +550,18 @@ def write_preview(path, res: Result, p: Params):
     X, Y = np.meshgrid(g, g)
     r = np.hypot(X, Y)
     up = prof["i_s"] + 1
-    z = np.interp(r, prof["R"][:up], prof["Z"][:up]) + displacement(prof, res.rand, res.stubs, res.scale, X, Y)
+    off = displacement(prof, res.rand, res.stubs, res.scale, X, Y) + deflector_field(res, p, X, Y)
+    z = np.interp(r, prof["R"][:up], prof["Z"][:up]) + off
     z = np.where(r <= prof["r_s"], z, np.nan)
     fig, ax = plt.subplots(1, 2, figsize=(11, 5.2))
     rgb = LightSource(azdeg=315, altdeg=40).shade(np.nan_to_num(z), plt.cm.cividis, vert_exag=6, blend_mode="overlay")
     rgb[np.isnan(z)] = 1.0
     ax[0].imshow(rgb, extent=[g[0], g[-1], g[0], g[-1]], origin="lower")
     ax[0].set_title(f"{p.variant}, d={p.diameter:g} mm, seed {p.seed} (hillshade, z exaggerated)")
-    d = displacement(prof, res.rand, res.stubs, res.scale, X, Y)
+    d = off
+    vmax = max(p.amp, p.bar_height if p.deflectors in ("diamonds", "both") else 0.0)
     im = ax[1].imshow(np.where(r <= prof["r_s"], d, np.nan), extent=[g[0], g[-1], g[0], g[-1]],
-                      origin="lower", cmap="RdBu_r", vmin=-p.amp, vmax=p.amp)
+                      origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
     ax[1].set_title("height offset vs. plain cone [mm]")
     fig.colorbar(im, ax=ax[1], shrink=0.8)
     for a_ in ax:
@@ -438,6 +590,14 @@ def parse_args(argv=None):
     ap.add_argument("--sigma", type=float, default=d.sigma)
     ap.add_argument("--dimple-ratio", type=float, default=d.dimple_ratio)
     ap.add_argument("--stubs", type=int, default=d.stubs)
+    ap.add_argument("--deflectors", choices=DEFLECTORS, default=d.deflectors,
+                    help="diamonds = tilted bars in rings, steps = concentric drops, both = combined")
+    ap.add_argument("--deflector-pitch", type=float, default=d.deflector_pitch, help="radial spacing of rings/risers, mm")
+    ap.add_argument("--step-height", type=float, default=d.step_height, help="drop of one riser, mm")
+    ap.add_argument("--bar-length", type=float, default=d.bar_length)
+    ap.add_argument("--bar-height", type=float, default=d.bar_height)
+    ap.add_argument("--bar-angle", type=float, default=d.bar_angle, help="bar tilt against the downhill direction, deg")
+    ap.add_argument("--bar-coverage", type=float, default=d.bar_coverage, help="max share of a ring blocked by bars")
     ap.add_argument("--min-slope", type=float, default=d.min_slope)
     ap.add_argument("--no-autofit", action="store_true")
     ap.add_argument("--res", type=float, default=d.res)
@@ -463,7 +623,9 @@ def main(argv=None):
                seed=a.seed, features=a.features, amp=a.amp, sigma=a.sigma,
                dimple_ratio=a.dimple_ratio, stubs=a.stubs, min_slope=a.min_slope,
                autofit=not a.no_autofit, res=a.res, sectors=a.sectors,
-               zone_base_r=a.zone_base_r, zone_wall_z=a.zone_wall_z)
+               zone_base_r=a.zone_base_r, zone_wall_z=a.zone_wall_z, deflectors=a.deflectors,
+               deflector_pitch=a.deflector_pitch, step_height=a.step_height, bar_length=a.bar_length,
+               bar_height=a.bar_height, bar_angle=a.bar_angle, bar_coverage=a.bar_coverage)
     if len(a.filaments) != 3:
         print("error: --filaments needs three numbers, e.g. 1,2,3", file=sys.stderr)
         return 2
@@ -473,7 +635,8 @@ def main(argv=None):
     except (ValueError, DescentError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    stem = a.output or f"dicetray_{p.variant}_d{p.diameter:g}" + (f"_s{p.seed}" if p.variant == "random" else "")
+    stem = a.output or (f"dicetray_{p.variant}_d{p.diameter:g}" + (f"_s{p.seed}" if p.variant == "random" else "")
+                        + (f"_{p.deflectors}" if p.deflectors != "none" else ""))
     if stem.lower().endswith((".stl", ".3mf")):
         stem = stem[:-4]
     i = res.info
@@ -493,6 +656,9 @@ def main(argv=None):
     print(f"  solid volume {i['volume_cm3']:.0f} cm3, {i['triangles']} triangles, watertight {i['watertight']}")
     print(f"  min descent angle {i['min_descent_deg']:.1f} deg (required {p.min_slope:g}), "
           f"amplitude scale {i['amp_scale']:.2f}, features {i['n_features']}, stubs {i['n_stubs']}")
+    if p.deflectors != "none":
+        print(f"  deflectors {p.deflectors}: {i['n_risers']} risers, {i['n_bars']} bars, "
+              f"deepest basin {i['max_pocket_mm']:.2f} mm (limit {POCKET_TOL:g})")
     for w in i["warnings"]:
         print(f"  warning: {w}", file=sys.stderr)
     if a.preview:
